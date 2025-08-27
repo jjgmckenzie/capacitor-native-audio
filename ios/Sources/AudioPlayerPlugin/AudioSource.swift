@@ -618,7 +618,7 @@ public class AudioSource: NSObject, AVAudioPlayerDelegate {
 
         if artworkSourceUrl.scheme != "https" {
             guard
-                let baseAppPath = pluginOwner.bridge?.config.appLocation
+                let baseAppPath = pluginOwner?.bridge?.config.appLocation
                     .absoluteString,
                 let baseAppPathUrl = URL.init(string: baseAppPath)
             else {
