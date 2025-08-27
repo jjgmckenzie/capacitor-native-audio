@@ -13,7 +13,7 @@ public class AudioSource: NSObject, AVAudioPlayerDelegate {
     var onReadyCallbackId: String = ""
     var onEndCallbackId: String = ""
 
-    private var pluginOwner: AudioPlayerPlugin
+    private weak var pluginOwner: AudioPlayerPlugin?
     @objc private var playerItem: AVPlayerItem!
     private var player: AVPlayer!
     @objc private var playerQueue: AVQueuePlayer!
@@ -58,7 +58,9 @@ public class AudioSource: NSObject, AVAudioPlayerDelegate {
         super.init()
 
         self.audioMetadata.setPluginOwner(pluginOwner: pluginOwner).setUpdateCallback(
-            callback: self.updateMetadata
+            callback: { [weak self] in
+                self?.updateMetadata()
+            }
         )
     }
 
@@ -248,13 +250,37 @@ public class AudioSource: NSObject, AVAudioPlayerDelegate {
 
     func destroy() {
         audioMetadata.stopUpdater()
+
+        // Clean up AVPlayerLooper first - this is crucial for loop audio
+        if loopAudio && playerLooper != nil {
+            playerLooper.disableLooping()
+            playerLooper = nil
+        }
+
+        // Clean up players
+        if loopAudio && playerQueue != nil {
+            playerQueue.pause()
+            playerQueue.removeAllItems()
+            playerQueue = nil
+        } else if player != nil {
+            player.pause()
+            player.replaceCurrentItem(with: nil)
+            player = nil
+        }
+
         removeOnEndObservation()
         audioReadyObservation?.invalidate()
         audioReadyObservation = nil
+
+        playerItem = nil
         isPaused = false
+
         removeRemoteTransportControls()
         removeNowPlaying()
         removeInterruptionNotifications()
+
+        // Clear artwork reference
+        nowPlayingArtwork = nil
     }
 
     private func createPlayerItem() throws -> AVPlayerItem {
@@ -501,17 +527,17 @@ public class AudioSource: NSObject, AVAudioPlayerDelegate {
 
         let commandCenter = MPRemoteCommandCenter.shared()
 
-        // Remove specific targets for this instance instead of all targets
-        commandCenter.playCommand.removeTarget(self)
-        commandCenter.pauseCommand.removeTarget(self)
-        commandCenter.skipBackwardCommand.removeTarget(self)
-        commandCenter.skipForwardCommand.removeTarget(self)
-
-        // Disable commands when removing
+        // Disable commands first
         commandCenter.playCommand.isEnabled = false
         commandCenter.pauseCommand.isEnabled = false
         commandCenter.skipBackwardCommand.isEnabled = false
         commandCenter.skipForwardCommand.isEnabled = false
+
+        // Remove ALL targets to ensure cleanup (since removeTarget(self) might not work reliably)
+        commandCenter.playCommand.removeTarget(nil)
+        commandCenter.pauseCommand.removeTarget(nil)
+        commandCenter.skipBackwardCommand.removeTarget(nil)
+        commandCenter.skipForwardCommand.removeTarget(nil)
     }
 
     private func updateMetadata() {
@@ -671,6 +697,7 @@ public class AudioSource: NSObject, AVAudioPlayerDelegate {
             return
         }
 
+        guard let pluginOwner = pluginOwner else { return }
         let call = pluginOwner.bridge?.savedCall(withID: callbackId)
 
         if data.isEmpty {
