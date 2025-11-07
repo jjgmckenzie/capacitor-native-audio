@@ -13,7 +13,7 @@ public class AudioSource: NSObject, AVAudioPlayerDelegate {
     var onReadyCallbackId: String = ""
     var onEndCallbackId: String = ""
 
-    private var pluginOwner: AudioPlayerPlugin
+    private weak var pluginOwner: AudioPlayerPlugin?
     @objc private var playerItem: AVPlayerItem!
     private var player: AVPlayer!
     @objc private var playerQueue: AVQueuePlayer!
@@ -58,8 +58,14 @@ public class AudioSource: NSObject, AVAudioPlayerDelegate {
         super.init()
 
         self.audioMetadata.setPluginOwner(pluginOwner: pluginOwner).setUpdateCallback(
-            callback: self.updateMetadata
+            callback: { [weak self] in
+                self?.updateMetadata()
+            }
         )
+    }
+
+    deinit {
+        destroy()
     }
 
     func initialize() throws {
@@ -244,11 +250,37 @@ public class AudioSource: NSObject, AVAudioPlayerDelegate {
 
     func destroy() {
         audioMetadata.stopUpdater()
+
+        // Clean up AVPlayerLooper first - this is crucial for loop audio
+        if loopAudio && playerLooper != nil {
+            playerLooper.disableLooping()
+            playerLooper = nil
+        }
+
+        // Clean up players
+        if loopAudio && playerQueue != nil {
+            playerQueue.pause()
+            playerQueue.removeAllItems()
+            playerQueue = nil
+        } else if player != nil {
+            player.pause()
+            player.replaceCurrentItem(with: nil)
+            player = nil
+        }
+
         removeOnEndObservation()
+        audioReadyObservation?.invalidate()
+        audioReadyObservation = nil
+
+        playerItem = nil
         isPaused = false
+
         removeRemoteTransportControls()
         removeNowPlaying()
         removeInterruptionNotifications()
+
+        // Clear artwork reference
+        nowPlayingArtwork = nil
     }
 
     private func createPlayerItem() throws -> AVPlayerItem {
@@ -326,7 +358,8 @@ public class AudioSource: NSObject, AVAudioPlayerDelegate {
         if loopAudio {
             audioReadyObservation = observe(
                 \.playerQueue?.currentItem?.status
-            ) { _, _ in
+            ) { [weak self] _, _ in
+                guard let self = self else { return }
                 if self.playerQueue.currentItem?.status
                     == AVPlayerItem.Status.readyToPlay {
                     self.makePluginCall(callbackId: self.onReadyCallbackId)
@@ -336,7 +369,8 @@ public class AudioSource: NSObject, AVAudioPlayerDelegate {
         } else {
             audioReadyObservation = observe(
                 \.playerItem?.status
-            ) { _, _ in
+            ) { [weak self] _, _ in
+                guard let self = self else { return }
                 if self.playerItem.status == AVPlayerItem.Status.readyToPlay {
                     self.makePluginCall(callbackId: self.onReadyCallbackId)
                     self.observeOnEnd()
@@ -375,6 +409,9 @@ public class AudioSource: NSObject, AVAudioPlayerDelegate {
         guard let observer = audioOnEndObservation else { return }
 
         NotificationCenter.default.removeObserver(observer)
+        if !loopAudio && player != nil {
+            player.removeTimeObserver(audioOnEndObservation as Any)
+        }
         audioOnEndObservation = nil
     }
 
@@ -386,7 +423,8 @@ public class AudioSource: NSObject, AVAudioPlayerDelegate {
         let commandCenter = MPRemoteCommandCenter.shared()
 
         commandCenter.playCommand.addTarget {
-            [unowned self] _ -> MPRemoteCommandHandlerStatus in
+            [weak self] _ -> MPRemoteCommandHandlerStatus in
+            guard let self = self else { return .commandFailed }
             if !self.isPlaying() {
                 self.play()
 
@@ -404,8 +442,9 @@ public class AudioSource: NSObject, AVAudioPlayerDelegate {
         }
 
         commandCenter.pauseCommand.addTarget {
-            [unowned self] _ -> MPRemoteCommandHandlerStatus in
-            print("Pause rate: " + String(self.player.rate))
+            [weak self] _ -> MPRemoteCommandHandlerStatus in
+            guard let self = self else { return .commandFailed }
+            print("Pause rate: " + String(self.player?.rate ?? 0))
 
             if self.isPlaying() {
                 self.pause()
@@ -425,7 +464,8 @@ public class AudioSource: NSObject, AVAudioPlayerDelegate {
 
         if showSeekBackward {
             commandCenter.skipBackwardCommand.addTarget {
-                [unowned self] _ -> MPRemoteCommandHandlerStatus in
+                [weak self] _ -> MPRemoteCommandHandlerStatus in
+                guard let self = self else { return .commandFailed }
                 var seekTime = floor(
                     self.getCurrentTime()
                         - Double(self.seekBackwardTime)
@@ -447,7 +487,8 @@ public class AudioSource: NSObject, AVAudioPlayerDelegate {
 
         if showSeekForward {
             commandCenter.skipForwardCommand.addTarget {
-                [unowned self] _ -> MPRemoteCommandHandlerStatus in
+                [weak self] _ -> MPRemoteCommandHandlerStatus in
+                guard let self = self else { return .commandFailed }
                 var seekTime = ceil(
                     self.getCurrentTime()
                         + Double(self.seekForwardTime)
@@ -485,6 +526,13 @@ public class AudioSource: NSObject, AVAudioPlayerDelegate {
 
         let commandCenter = MPRemoteCommandCenter.shared()
 
+        // Disable commands first
+        commandCenter.playCommand.isEnabled = false
+        commandCenter.pauseCommand.isEnabled = false
+        commandCenter.skipBackwardCommand.isEnabled = false
+        commandCenter.skipForwardCommand.isEnabled = false
+
+        // Remove ALL targets to ensure cleanup (since removeTarget(self) might not work reliably)
         commandCenter.playCommand.removeTarget(nil)
         commandCenter.pauseCommand.removeTarget(nil)
         commandCenter.skipBackwardCommand.removeTarget(nil)
@@ -511,7 +559,10 @@ public class AudioSource: NSObject, AVAudioPlayerDelegate {
         nowPlayingInfo[MPMediaItemPropertyPlaybackDuration] = getDuration()
         nowPlayingInfo[MPNowPlayingInfoPropertyElapsedPlaybackTime] =
             getCurrentTime()
-        nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackRate] = player.rate
+
+        if !loopAudio && player != nil {
+            nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackRate] = player.rate
+        }
 
         let artwork = getNowPlayingArtwork()
 
@@ -566,7 +617,7 @@ public class AudioSource: NSObject, AVAudioPlayerDelegate {
 
         if artworkSourceUrl.scheme != "https" {
             guard
-                let baseAppPath = pluginOwner.bridge?.config.appLocation
+                let baseAppPath = pluginOwner?.bridge?.config.appLocation
                     .absoluteString,
                 let baseAppPathUrl = URL.init(string: baseAppPath)
             else {
@@ -581,8 +632,10 @@ public class AudioSource: NSObject, AVAudioPlayerDelegate {
 
         URLSession.shared.dataTask(
             with: artworkSourceUrl
-        ) { data, _, _ in
-            guard let imageData = data, let image = UIImage(data: imageData)
+        ) { [weak self] data, _, _ in
+            guard let self = self,
+                  let imageData = data,
+                  let image = UIImage(data: imageData)
             else {
                 print(
                     "Error: artworkSource data is invalid - "
@@ -643,6 +696,7 @@ public class AudioSource: NSObject, AVAudioPlayerDelegate {
             return
         }
 
+        guard let pluginOwner = pluginOwner else { return }
         let call = pluginOwner.bridge?.savedCall(withID: callbackId)
 
         if data.isEmpty {
