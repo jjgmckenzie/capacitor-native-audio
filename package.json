@@ -1,6 +1,6 @@
 {
     "name": "@mediagrid/capacitor-native-audio",
-    "version": "2.3.0",
+    "version": "2.3.1",
     "description": "Play audio in a Capacitor app natively from a URL/web source simultaneously with background audio.",
     "main": "dist/plugin.cjs.js",
     "module": "dist/esm/index.js",
@@ -58,6 +58,7 @@
         "@ionic/prettier-config": "^4.0.0",
         "@ionic/swiftlint-config": "^2.0.0",
         "eslint": "^8.57.0",
+        "patch-package": "^8.0.1",
         "prettier": "^3.4.2",
         "prettier-plugin-java": "^2.6.6",
         "rimraf": "^6.0.1",
